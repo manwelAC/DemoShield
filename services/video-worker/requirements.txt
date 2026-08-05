@@ -1,0 +1,8 @@
+# Install the local processing dependencies with:
+# python -m pip install -r requirements.txt
+opencv-python>=4.9
+pydantic>=2.7
+
+# Optional OCR support for the first implementation pass:
+# paddleocr>=2.7
+# paddlepaddle>=2.6
