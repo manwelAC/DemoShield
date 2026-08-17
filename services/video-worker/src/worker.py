@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from .detection import detect_text
+from .detection import classify_ocr_items
+from .detection_merge import merge_findings
+from .frames.sampler import sample_video
+from .ocr.paddle import PaddleOcrEngine
+
+_ocr_engine: PaddleOcrEngine | None = None
+
+
+def get_ocr_engine() -> PaddleOcrEngine:
+    global _ocr_engine
+    if _ocr_engine is None:
+        _ocr_engine = PaddleOcrEngine()
+    return _ocr_engine
 from .protocol import Request, Response
 
 
@@ -41,10 +53,34 @@ def handle(request: Request) -> Response:
     if request.command == "metadata":
         return Response(id=request.id, data={"source": metadata(request.source or "")})
     if request.command == "scan":
-        # OCR is intentionally an adapter seam: sampled frame text will be passed here
-        # once PaddleOCR is enabled in the processing environment.
-        text = " ".join(str(item.get("text", "")) for item in request.redactions)
-        return Response(id=request.id, data={"findings": detect_text(text)})
+        if not request.source:
+            raise ValueError("Scan requires a source video path")
+        emit(Response(id=request.id, event="progress", data={"phase": "ocr_loading", "progress": 0, "sampledFrames": 0, "totalSamples": 0}))
+        ocr = get_ocr_engine()
+        recognized_texts = 0
+
+        def process_batch(frames: list[Any], timestamps: list[float]) -> list[dict[str, Any]]:
+            nonlocal recognized_texts
+            findings: list[dict[str, Any]] = []
+            for timestamp, recognized in zip(timestamps, ocr.recognize_many(frames), strict=True):
+                recognized_texts += len(recognized)
+                findings.extend(classify_ocr_items(recognized, timestamp, request.sampleIntervalSeconds))
+            return findings
+
+        data = sample_video(
+            request.source,
+            request.sampleIntervalSeconds,
+            lambda progress: emit(Response(id=request.id, event="progress", data=progress)),
+            process_batch,
+            heartbeat_seconds=request.heartbeatSeconds,
+            change_threshold=request.changeThreshold,
+            ocr_max_width=request.ocrMaxWidth,
+            ocr_batch_size=request.ocrBatchSize,
+        )
+        data["findings"] = merge_findings(data["findings"], request.heartbeatSeconds * 1.1)
+        data["stats"]["recognizedTexts"] = recognized_texts
+        data["stats"]["matchedFindings"] = len(data["findings"])
+        return Response(id=request.id, data=data)
     if request.command == "export":
         if not request.source or not request.output:
             raise ValueError("Export requires source and output paths")

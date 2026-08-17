@@ -1,4 +1,4 @@
-import { StrictMode, useRef, useState } from 'react';
+import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { SourceVideo } from './types/models';
 import './styles.css';
@@ -14,6 +14,7 @@ type Finding = {
   endTime: number;
   confidence: number;
   status: FindingStatus;
+  region: { x: number; y: number; width: number; height: number };
 };
 
 const formatTime = (seconds: number) => {
@@ -36,10 +37,16 @@ function App() {
   const [importError, setImportError] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [timelineExpanded, setTimelineExpanded] = useState(false);
+  const [scanState, setScanState] = useState<'idle' | 'running' | 'complete' | 'canceled' | 'error'>('idle');
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanStats, setScanStats] = useState<ScanStats | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const protectedCount = findings.filter((finding) => finding.status === 'protected').length;
   const exposedCount = findings.filter((finding) => finding.status === 'exposed').length;
+
+  useEffect(() => window.demoShield?.onScanProgress((progress) => setScanProgress(progress)), []);
 
   const importVideo = async () => {
     if (!window.demoShield) {
@@ -58,12 +65,69 @@ function App() {
       setVideoError(null);
       setFindings([]);
       setSelectedId(null);
+      setScanState('idle');
+      setScanProgress(null);
+      setScanError(null);
+      setScanStats(null);
       setSection('media');
     } catch (error) {
       setImportError(error instanceof Error ? error.message : 'Unable to import video');
     } finally {
       setImporting(false);
     }
+  };
+
+  const runScan = async () => {
+    if (!sourceVideo || !window.demoShield || scanState === 'running') return;
+    setSection('scan');
+    setScanState('running');
+    setScanProgress(null);
+    setScanError(null);
+    setScanStats(null);
+    try {
+      const result = await window.demoShield.startScan({
+        sampleIntervalSeconds: 0.5,
+        heartbeatSeconds: 2,
+        changeThreshold: 0.035,
+        ocrMaxWidth: 1280,
+        ocrBatchSize: 4,
+      });
+      if (result.canceled) {
+        setScanState('canceled');
+        return;
+      }
+      setFindings(result.findings.map((finding) => ({
+        id: finding.id,
+        category: finding.category,
+        label: finding.label,
+        value: finding.detectedText,
+        startTime: finding.startTime,
+        endTime: Math.min(finding.endTime, sourceVideo.duration),
+        confidence: finding.confidence,
+        status: 'exposed',
+        region: finding.region,
+      })));
+      setSelectedId(result.findings[0]?.id || null);
+      setScanStats(result.stats || null);
+      setScanState('complete');
+      if (result.findings.length > 0) {
+        const firstTime = result.findings[0].startTime;
+        setCurrentTime(firstTime);
+        if (videoRef.current) {
+          videoRef.current.pause();
+          videoRef.current.currentTime = firstTime;
+        }
+        setSection('review');
+      }
+    } catch (error) {
+      setScanError(error instanceof Error ? error.message : 'Privacy scan failed');
+      setScanState('error');
+    }
+  };
+
+  const cancelScan = async () => {
+    if (!window.demoShield || scanState !== 'running') return;
+    await window.demoShield.cancelScan();
   };
 
   const togglePlayback = async () => {
@@ -79,6 +143,17 @@ function App() {
     if (videoRef.current) videoRef.current.currentTime = nextTime;
   };
 
+  const selectFinding = (id: string) => {
+    setSelectedId(id);
+    const finding = findings.find((item) => item.id === id);
+    if (!finding) return;
+    setCurrentTime(finding.startTime);
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = finding.startTime;
+    }
+  };
+
   return (
     <div className="app">
       <TopBar source={sourceVideo} protectedCount={protectedCount} findingCount={findings.length} />
@@ -91,9 +166,9 @@ function App() {
             importError={importError}
             canScan={Boolean(sourceVideo)}
             onImport={importVideo}
-            onScan={() => setSection('scan')}
+            onScan={() => void runScan()}
           />
-          {section === 'media' && (
+          {(section === 'media' || section === 'review') && (
             <MediaWorkspace
               source={sourceVideo}
               videoUrl={videoUrl}
@@ -106,7 +181,7 @@ function App() {
               videoError={videoError}
               timelineExpanded={timelineExpanded}
               onImport={importVideo}
-              onSelect={setSelectedId}
+              onSelect={selectFinding}
               onPlay={togglePlayback}
               onSeek={seek}
               onPlayingChange={setPlaying}
@@ -116,14 +191,20 @@ function App() {
               onTimelineToggle={() => setTimelineExpanded((value) => !value)}
             />
           )}
-          {section !== 'media' && (
+          {(section === 'scan' || section === 'export') && (
             <WorkflowView
               section={section}
               source={sourceVideo}
               findings={findings}
               protectedCount={protectedCount}
+              scanState={scanState}
+              scanProgress={scanProgress}
+              scanError={scanError}
+              scanStats={scanStats}
               onImport={importVideo}
               onNavigate={setSection}
+              onStartScan={() => void runScan()}
+              onCancelScan={() => void cancelScan()}
             />
           )}
         </main>
@@ -182,7 +263,7 @@ function MediaWorkspace(props: {
           <div className="stage-label"><span className="live-dot" /> PREVIEW {props.source && <><span>·</span> {formatTime(props.currentTime)}</>}</div>
           <div className={`fake-video ${props.videoUrl ? 'real-video' : 'empty-video'}`}>
             {props.videoUrl ? (
-              <><video ref={props.videoRef} className="video-element" src={props.videoUrl} onPlay={() => props.onPlayingChange(true)} onPause={() => props.onPlayingChange(false)} onTimeUpdate={(event) => props.onTimeChange(event.currentTarget.currentTime)} onLoadedMetadata={(event) => props.onDurationChange(event.currentTarget.duration)} onError={(event) => props.onVideoError(event.currentTarget.error?.message || 'This video codec cannot be decoded by Electron.')} />{props.videoError && <div className="video-error"><b>Preview unavailable</b><p>{props.videoError}</p></div>}</>
+              <><video ref={props.videoRef} className="video-element" src={props.videoUrl} onPlay={() => props.onPlayingChange(true)} onPause={() => props.onPlayingChange(false)} onTimeUpdate={(event) => props.onTimeChange(event.currentTarget.currentTime)} onLoadedMetadata={(event) => props.onDurationChange(event.currentTarget.duration)} onError={(event) => props.onVideoError(event.currentTarget.error?.message || 'This video codec cannot be decoded by Electron.')} />{props.findings.filter((finding) => props.currentTime >= finding.startTime && props.currentTime <= finding.endTime).map((finding) => <button key={finding.id} className={`finding-overlay ${finding.status} ${props.selectedId === finding.id ? 'selected' : ''}`} style={{ left: `${finding.region.x * 100}%`, top: `${finding.region.y * 100}%`, width: `${finding.region.width * 100}%`, height: `${finding.region.height * 100}%` }} onClick={() => props.onSelect(finding.id)}><span>{finding.label}</span></button>)}{props.videoError && <div className="video-error"><b>Preview unavailable</b><p>{props.videoError}</p></div>}</>
             ) : (
               <div className="empty-preview"><div className="empty-preview-mark">▣</div><b>Import a screen recording</b><p>Select a local video to begin reviewing it for sensitive information.</p><button className="import" onClick={props.onImport}>＋ Choose video</button></div>
             )}
@@ -222,11 +303,29 @@ function Timeline({ findings, duration, currentTime, expanded, onToggle, onSelec
   );
 }
 
-function WorkflowView({ section, source, findings, protectedCount, onImport, onNavigate }: { section: Exclude<Section, 'media'>; source: SourceVideo | null; findings: Finding[]; protectedCount: number; onImport: () => void; onNavigate: (section: Section) => void }) {
-  if (!source) return <section className="workflow"><div className="workflow-intro"><span className="eyebrow">NO SOURCE VIDEO</span><h2>Import a recording first.</h2><p>DemoShield needs a local source video before this workflow is available.</p><button className="import large" onClick={onImport}>＋ Import video</button></div></section>;
-  if (section === 'scan') return <section className="workflow"><div className="workflow-intro"><span className="eyebrow">LOCAL DETECTION</span><h2>Ready to scan this recording.</h2><p>Frame sampling and OCR integration are the next backend milestone. No sample findings will be generated.</p><button className="scan large" disabled>Scanning not connected yet</button></div></section>;
-  if (section === 'review') return <section className="workflow"><div className="workflow-intro"><span className="eyebrow">REVIEW QUEUE</span><h2>{findings.length ? 'Review detected exposure.' : 'Nothing to review yet.'}</h2><p>{findings.length ? 'Approve, adjust, or ignore every finding.' : 'Run a privacy scan or create a manual redaction to populate this queue.'}</p><button className="import large" onClick={() => onNavigate('media')}>Return to editor</button></div></section>;
-  return <section className="workflow export-view"><div className="workflow-intro"><span className="eyebrow">SANITIZED OUTPUT</span><h2>{findings.length && protectedCount === findings.length ? 'Ready to export.' : 'Protection review incomplete.'}</h2><p>{protectedCount} of {findings.length} findings are protected. Export rendering is not connected yet.</p><button className="export large" disabled>Export unavailable</button></div><div className="export-spec"><div><span>OUTPUT FORMAT</span><b>MP4 · H.264</b></div><div><span>SOURCE</span><b>{source.fileName}</b></div></div></section>;
+function WorkflowView(props: {
+  section: Exclude<Section, 'media'>;
+  source: SourceVideo | null;
+  findings: Finding[];
+  protectedCount: number;
+  scanState: 'idle' | 'running' | 'complete' | 'canceled' | 'error';
+  scanProgress: ScanProgress | null;
+  scanError: string | null;
+  scanStats: ScanStats | null;
+  onImport: () => void;
+  onNavigate: (section: Section) => void;
+  onStartScan: () => void;
+  onCancelScan: () => void;
+}) {
+  if (!props.source) return <section className="workflow"><div className="workflow-intro"><span className="eyebrow">NO SOURCE VIDEO</span><h2>Import a recording first.</h2><p>DemoShield needs a local source video before this workflow is available.</p><button className="import large" onClick={props.onImport}>＋ Import video</button></div></section>;
+  if (props.section === 'scan') {
+    const percent = Math.round((props.scanProgress?.progress || 0) * 100);
+    const headings = { idle: 'Ready to scan this recording.', running: 'Inspecting sampled frames…', complete: 'Frame sampling complete.', canceled: 'Scan canceled.', error: 'Scan failed.' };
+    const phaseLabel = props.scanProgress?.phase === 'ocr_loading' ? 'LOADING OCR' : props.scanProgress?.phase === 'finalizing' ? 'FINALIZING RESULTS' : props.scanProgress?.phase === 'complete' ? 'SCAN COMPLETE' : props.scanState === 'running' ? 'ADAPTIVE SCAN' : 'SCAN STATUS';
+    return <section className="workflow scan-workflow"><div className="workflow-intro"><span className="eyebrow">LOCAL DETECTION</span><h2>{headings[props.scanState]}</h2><p>{props.scanState === 'complete' ? props.findings.length ? `OCR read ${props.scanStats?.recognizedTexts || 0} text regions and classified ${props.findings.length} sensitive exposure${props.findings.length === 1 ? '' : 's'}.` : `OCR read ${props.scanStats?.recognizedTexts || 0} text regions, but none matched the enabled privacy rules.` : props.scanState === 'error' ? props.scanError : 'DemoShield inspects lightweight frames and runs OCR only on meaningful visual changes. Nothing leaves this device.'}</p><div className="scan-actions">{props.scanState === 'running' ? <button className="quiet large" onClick={props.onCancelScan}>Cancel scan</button> : props.scanState === 'complete' && props.findings.length ? <button className="scan large" onClick={() => props.onNavigate('review')}>Review findings →</button> : <button className="scan large" onClick={props.onStartScan}>✦ Scan again</button>}</div></div><div className="scan-monitor"><div className="scan-monitor-head"><span>{phaseLabel}</span><b>{percent}%</b></div><div className="scan-progress"><i style={{ width: `${percent}%` }} /></div><div className="scan-monitor-meta"><span>{props.scanProgress?.sampledFrames || 0} inspected · {props.scanProgress?.ocrFrames || 0} OCR · {props.scanProgress?.skippedFrames || 0} skipped</span><span>{props.scanStats ? `${props.scanStats.ocrSeconds.toFixed(1)}s OCR` : props.scanProgress?.timestamp !== undefined ? formatTime(props.scanProgress.timestamp) : '—'}</span></div></div></section>;
+  }
+  if (props.section === 'review') return <section className="workflow"><div className="workflow-intro"><span className="eyebrow">REVIEW QUEUE</span><h2>{props.findings.length ? 'Review detected exposure.' : 'Nothing to review yet.'}</h2><p>{props.findings.length ? 'Approve, adjust, or ignore every finding.' : 'Complete a privacy scan to populate this queue.'}</p><button className="import large" onClick={() => props.onNavigate('media')}>Return to editor</button></div></section>;
+  return <section className="workflow export-view"><div className="workflow-intro"><span className="eyebrow">SANITIZED OUTPUT</span><h2>{props.findings.length && props.protectedCount === props.findings.length ? 'Ready to export.' : 'Protection review incomplete.'}</h2><p>{props.protectedCount} of {props.findings.length} findings are protected. Export rendering is not connected yet.</p><button className="export large" disabled>Export unavailable</button></div><div className="export-spec"><div><span>OUTPUT FORMAT</span><b>MP4 · H.264</b></div><div><span>SOURCE</span><b>{props.source.fileName}</b></div></div></section>;
 }
 
 function Nav({ icon, label, active, badge, onClick }: { icon: string; label: string; active?: boolean; badge?: number; onClick?: () => void }) {

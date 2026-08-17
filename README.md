@@ -14,27 +14,30 @@ DemoShield is under active development. The current build includes:
 - Secure local video streaming and playback
 - Python worker process with a JSON-lines protocol
 - FFprobe video metadata extraction
+- OpenCV frame sampling with progress and cancellation
+- Local PaddleOCR text recognition and sensitive-pattern classification
 - Media, Scan, Review, and Export workflow surfaces
 
-OCR scanning, manual redaction editing, project persistence, and rendered video export are still in development.
+Manual redaction editing, project persistence, and rendered video export are still in development.
 
 ## Requirements
 
 - Node.js and npm
-- Python 3
+- Python 3.9–3.13 for the PaddleOCR worker
 - FFmpeg and FFprobe available on `PATH`
 
 Install Python worker dependencies:
 
 ```powershell
 cd services/video-worker
-py -3 -m pip install -r requirements.txt
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 Verify the local processing tools:
 
 ```powershell
-py -3 --version
+.\.venv\Scripts\python.exe --version
 ffmpeg -version
 ffprobe -version
 ```

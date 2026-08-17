@@ -12,6 +12,9 @@ let devServer;
 const projectRoot = path.join(__dirname, '..');
 const worker = new WorkerClient(projectRoot);
 const authorizedMedia = new Map();
+let activeSourcePath = null;
+let scanRunning = false;
+let scanCanceled = false;
 
 protocol.registerSchemesAsPrivileged([{
   scheme: 'demoshield-media',
@@ -73,12 +76,50 @@ ipcMain.handle('video:open', async () => {
   const stats = await fs.stat(sourcePath);
   if (!stats.isFile() || stats.size === 0) throw new Error('The selected video is empty or invalid');
   const data = await worker.request('metadata', { source: sourcePath });
+  activeSourcePath = sourcePath;
   const mediaId = crypto.randomUUID();
   authorizedMedia.set(mediaId, sourcePath);
   return { source: data.source, previewUrl: `demoshield-media://video/${mediaId}` };
 });
 
 ipcMain.handle('worker:ping', () => worker.request('ping'));
+
+ipcMain.handle('scan:start', async (event, options = {}) => {
+  if (!activeSourcePath) throw new Error('Import a source video before scanning');
+  if (scanRunning) throw new Error('A privacy scan is already running');
+  scanRunning = true;
+  scanCanceled = false;
+  try {
+    const sampleIntervalSeconds = Number(options.sampleIntervalSeconds || 0.5);
+    const heartbeatSeconds = Number(options.heartbeatSeconds || 2);
+    const changeThreshold = Number(options.changeThreshold || 0.035);
+    const ocrMaxWidth = Number(options.ocrMaxWidth || 1280);
+    const ocrBatchSize = Number(options.ocrBatchSize || 4);
+    const result = await worker.request(
+      'scan',
+      { source: activeSourcePath, sampleIntervalSeconds, heartbeatSeconds, changeThreshold, ocrMaxWidth, ocrBatchSize },
+      {
+        timeoutMs: 30 * 60 * 1000,
+        onProgress: (progress) => {
+          if (!event.sender.isDestroyed()) event.sender.send('scan:progress', progress);
+        },
+      },
+    );
+    return { canceled: false, ...result };
+  } catch (error) {
+    if (scanCanceled) return { canceled: true, findings: [] };
+    throw error;
+  } finally {
+    scanRunning = false;
+  }
+});
+
+ipcMain.handle('scan:cancel', () => {
+  if (!scanRunning) return false;
+  scanCanceled = true;
+  worker.stop();
+  return true;
+});
 
 ipcMain.handle('project:save', async (_event, project) => {
   const result = await dialog.showSaveDialog({ defaultPath: `${project.name || 'untitled'}.demoshield`, filters: [{ name: 'DemoShield project', extensions: ['demoshield'] }] });
